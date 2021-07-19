@@ -344,6 +344,10 @@ bool ConfigApi::get(
   return true;
 }
 
+bool ConfigApi::partialReconfigurableSource(const std::string&, std::string&) {
+  return false;
+}
+
 void ConfigApi::trackConfigSources() {
   std::lock_guard<std::mutex> lock(fileInfoMutex_);
   tracking_ = true;
@@ -467,7 +471,7 @@ void ConfigApi::dumpConfigSourceToDisk(
       if (atomicallyWriteFileToDisk(contents, filePath)) {
         // Makes sure the file has the correct permission for when we decide to
         // run mcrouter with another user.
-        ensureHasPermission(filePath, 0664);
+        ensureHasPermission(filePath, 0644);
         backupFileIt->second = md5OrVersion;
       } else {
         logFailureEveryN<DumpFileTag>(
@@ -516,8 +520,8 @@ bool ConfigApi::readFromBackupFile(
     return false;
   }
 
-  LOG(INFO) << "Reading config source " << sourcePrefix << name
-            << " from backup.";
+  VLOG(1) << "Reading config source " << sourcePrefix << name
+          << " from backup.";
   return folly::readFile(filePath.c_str(), contents);
 }
 
@@ -538,6 +542,17 @@ void ConfigApi::enableReadingFromBackupFiles() {
 bool ConfigApi::shouldReadFromBackupFiles() const {
   return readFromBackupFiles_;
 }
+
+std::vector<ConfigApi::PartialUpdate> ConfigApi::releasePartialUpdatesLocked() {
+  return {};
+}
+
+bool ConfigApi::updatePartialConfigSource(
+    std::vector<ConfigApi::PartialUpdate> /*updates*/) {
+  return true;
+}
+
+void ConfigApi::addPartialUpdateForTest(PartialUpdate&) {}
 
 } // namespace mcrouter
 } // namespace memcache

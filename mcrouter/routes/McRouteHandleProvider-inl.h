@@ -25,6 +25,7 @@
 #include "mcrouter/lib/network/SecurityOptions.h"
 #include "mcrouter/lib/network/ThriftTransport.h"
 #include "mcrouter/lib/network/gen/MemcacheRouterInfo.h"
+#include "mcrouter/routes/AllFastestRouteFactory.h"
 #include "mcrouter/routes/AsynclogRoute.h"
 #include "mcrouter/routes/DestinationRoute.h"
 #include "mcrouter/routes/ExtraRouteHandleProviderIf.h"
@@ -41,6 +42,37 @@
 namespace facebook {
 namespace memcache {
 namespace mcrouter {
+
+extern template MemcacheRouterInfo::RouteHandlePtr
+createHashRoute<MemcacheRouterInfo>(
+    const folly::dynamic& json,
+    std::vector<MemcacheRouterInfo::RouteHandlePtr> rh,
+    size_t threadId);
+
+extern template MemcacheRouterInfo::RouteHandlePtr
+makeAllFastestRoute<MemcacheRouterInfo>(
+    RouteHandleFactory<MemcacheRouterInfo::RouteHandleIf>& factory,
+    const folly::dynamic& json);
+
+extern template MemcacheRouterInfo::RouteHandlePtr
+makeFailoverRouteWithFailoverErrorSettings<
+    MemcacheRouterInfo,
+    FailoverRoute,
+    FailoverErrorsSettings>(
+    const folly::dynamic& json,
+    std::vector<MemcacheRouterInfo::RouteHandlePtr> children,
+    FailoverErrorsSettings failoverErrors,
+    const folly::dynamic* jFailoverPolicy);
+
+extern template const std::vector<MemcacheRouterInfo::RouteHandlePtr>&
+McRouteHandleProvider<MemcacheRouterInfo>::makePool(
+    RouteHandleFactory<MemcacheRouteHandleIf>& factory,
+    const PoolFactory::PoolJson& json);
+
+extern template MemcacheRouterInfo::RouteHandlePtr
+McRouteHandleProvider<MemcacheRouterInfo>::makePoolRoute(
+    RouteHandleFactory<MemcacheRouteHandleIf>& factory,
+    const folly::dynamic& json);
 
 template <class RouterInfo>
 std::shared_ptr<typename RouterInfo::RouteHandleIf> makeLoggingRoute(
@@ -155,25 +187,6 @@ McRouteHandleProvider<RouterInfo>::makePool(
       }
     }
 
-    mc_protocol_t protocol = mc_ascii_protocol;
-    if (auto jProtocol = json.get_ptr("protocol")) {
-      auto str = parseString(*jProtocol, "protocol");
-      if (equalStr("ascii", str, folly::AsciiCaseInsensitive())) {
-        protocol = mc_ascii_protocol;
-      } else if (equalStr("caret", str, folly::AsciiCaseInsensitive())) {
-        protocol = mc_caret_protocol;
-      } else if (equalStr("thrift", str, folly::AsciiCaseInsensitive())) {
-        protocol = mc_thrift_protocol;
-      } else {
-        throwLogic("Unknown protocol '{}'", str);
-      }
-    }
-
-    bool enableCompression = proxy_.router().opts().enable_compression;
-    if (auto jCompression = json.get_ptr("enable_compression")) {
-      enableCompression = parseBool(*jCompression, "enable_compression");
-    }
-
     bool keepRoutingPrefix = false;
     if (auto jKeepRoutingPrefix = json.get_ptr("keep_routing_prefix")) {
       keepRoutingPrefix = parseBool(*jKeepRoutingPrefix, "keep_routing_prefix");
@@ -191,66 +204,8 @@ McRouteHandleProvider<RouterInfo>::makePool(
       }
     }
 
-    SecurityMech mech = SecurityMech::NONE;
-    folly::Optional<SecurityMech> mechOverride;
-    folly::Optional<SecurityMech> withinDcMech;
-    folly::Optional<SecurityMech> crossDcMech;
-    folly::Optional<uint16_t> crossDcPort;
-    folly::Optional<uint16_t> withinDcPort;
-    // default to 0, which doesn't override
-    uint16_t port = 0;
-    if (proxy_.router().configApi().enableSecurityConfig()) {
-      if (auto jSecurityMech = json.get_ptr("security_mech_within_dc")) {
-        auto mechStr = parseString(*jSecurityMech, "security_mech_within_dc");
-        withinDcMech = parseSecurityMech(mechStr);
-      }
+    auto apAttr = getCommonAccessPointAttributes(json, proxy_.router());
 
-      if (auto jSecurityMech = json.get_ptr("security_mech_cross_dc")) {
-        auto mechStr = parseString(*jSecurityMech, "security_mech_cross_dc");
-        crossDcMech = parseSecurityMech(mechStr);
-      }
-
-      if (withinDcMech.has_value() && crossDcMech.has_value() &&
-          withinDcMech.value() == crossDcMech.value()) {
-        // mech is used if nothing is specified in server ap
-        mech = withinDcMech.value();
-        // mechOverride overrides per-server values
-        mechOverride = withinDcMech.value();
-        withinDcMech.reset();
-        crossDcMech.reset();
-      } else {
-        if (auto jSecurityMech = json.get_ptr("security_mech")) {
-          auto mechStr = parseString(*jSecurityMech, "security_mech");
-          mech = parseSecurityMech(mechStr);
-        } else if (auto jUseSsl = json.get_ptr("use_ssl")) {
-          // deprecated - prefer security_mech
-          auto useSsl = parseBool(*jUseSsl, "use_ssl");
-          if (useSsl) {
-            mech = SecurityMech::TLS;
-          }
-        }
-      }
-
-      if (auto jPort = json.get_ptr("port_override_within_dc")) {
-        withinDcPort = parseInt(*jPort, "port_override_within_dc", 1, 65535);
-      }
-
-      if (auto jPort = json.get_ptr("port_override_cross_dc")) {
-        crossDcPort = parseInt(*jPort, "port_override_cross_dc", 1, 65535);
-      }
-
-      if (withinDcPort.has_value() && crossDcPort.has_value() &&
-          withinDcPort.value() == crossDcPort.value()) {
-        port = withinDcPort.value();
-        withinDcPort.reset();
-        crossDcPort.reset();
-      } else {
-        // parse port override only if withinDc & crossDc are not present
-        if (auto jPort = json.get_ptr("port_override")) {
-          port = parseInt(*jPort, "port_override", 1, 65535);
-        }
-      }
-    }
     bool disableRequestDeadlineCheck =
         proxy_.router().opts().disable_request_deadline_check;
     if (auto jRequestDeadline =
@@ -337,58 +292,15 @@ McRouteHandleProvider<RouterInfo>::makePool(
       if (failureDomain == 0) {
         proxy_.stats().increment(dest_with_no_failure_domain_count_stat);
       }
-      auto ap = AccessPoint::create(
-          server.stringPiece(),
-          protocol,
-          mech,
-          port,
-          enableCompression,
-          failureDomain);
-      checkLogic(ap != nullptr, "invalid server {}", server.stringPiece());
 
-      if (mechOverride.has_value()) {
-        ap->setSecurityMech(mechOverride.value());
-      }
-
-      if (withinDcMech.has_value() || crossDcMech.has_value() ||
-          withinDcPort.has_value() || crossDcPort.has_value()) {
-        bool isInLocalDc = isInLocalDatacenter(ap->getHost());
-        if (isInLocalDc) {
-          if (withinDcMech.has_value()) {
-            ap->setSecurityMech(withinDcMech.value());
-          }
-          if (withinDcPort.has_value()) {
-            ap->setPort(withinDcPort.value());
-          }
-        } else {
-          if (crossDcMech.has_value()) {
-            ap->setSecurityMech(crossDcMech.value());
-          }
-          if (crossDcPort.has_value()) {
-            ap->setPort(crossDcPort.value());
-          }
-        }
-      }
-
-      if (ap->compressed() && proxy_.router().getCodecManager() == nullptr) {
-        if (!initCompression(proxy_.router())) {
-          MC_LOG_FAILURE(
-              opts,
-              failure::Category::kBadEnvironment,
-              "Pool {}: Failed to initialize compression. "
-              "Disabling compression for host: {}",
-              name,
-              server.stringPiece());
-          ap->disableCompression();
-        }
-      }
+      auto ap = createAccessPoint(
+          server.stringPiece(), failureDomain, proxy_.router(), *apAttr);
 
       auto it = accessPoints_.find(name);
       if (it == accessPoints_.end()) {
-        std::vector<std::shared_ptr<const AccessPoint>> accessPoints;
+        std::unordered_set<std::shared_ptr<const AccessPoint>> accessPoints;
         it = accessPoints_.emplace(name, std::move(accessPoints)).first;
       }
-      it->second.push_back(ap);
       folly::StringPiece nameSp = it->first;
 
       if (ap->getProtocol() == mc_thrift_protocol) {
@@ -402,7 +314,7 @@ McRouteHandleProvider<RouterInfo>::makePool(
             securityMechToString(ap->getSecurityMech()));
 
         using Transport = ThriftTransport<RouterInfo>;
-        destinations.push_back(createDestinationRoute<Transport>(
+        auto destResult = createDestinationRoute<Transport>(
             std::move(ap),
             timeout,
             connectTimeout,
@@ -413,10 +325,12 @@ McRouteHandleProvider<RouterInfo>::makePool(
             poolStatIndex,
             disableRequestDeadlineCheck,
             poolTkoTracker,
-            keepRoutingPrefix));
+            keepRoutingPrefix);
+        it->second.insert(destResult.second);
+        destinations.push_back(std::move(destResult.first));
       } else {
         using Transport = AsyncMcClient;
-        destinations.push_back(createDestinationRoute<Transport>(
+        auto destResult = createDestinationRoute<Transport>(
             std::move(ap),
             timeout,
             connectTimeout,
@@ -427,10 +341,59 @@ McRouteHandleProvider<RouterInfo>::makePool(
             poolStatIndex,
             disableRequestDeadlineCheck,
             poolTkoTracker,
-            keepRoutingPrefix));
+            keepRoutingPrefix);
+        it->second.insert(destResult.second);
+        destinations.push_back(std::move(destResult.first));
       }
     } // servers
 
+    if (auto jPoolConfigPath = json.get_ptr("pool_config_path")) {
+      auto enablePartialReconfig = json["enable_partial_reconfig"].asBool() &&
+          apAttr->protocol >= mc_caret_protocol;
+      auto poolConfigPath = jPoolConfigPath->getString();
+      folly::dynamic poolConfigJson = folly::dynamic::object;
+      for (auto propName : json.keys()) {
+        const auto jProp = json.get_ptr(propName);
+        if (jProp->isArray() || propName == "services") {
+          continue;
+        }
+        poolConfigJson[propName] = *jProp;
+      }
+      poolConfigJson["enable_partial_reconfig"] = enablePartialReconfig;
+
+      auto it = partialConfigs_.find(poolConfigPath);
+
+      if (it == partialConfigs_.end()) {
+        apAttr->json = folly::dynamic::object;
+        apAttr->json[name] = poolConfigJson;
+        std::vector<std::string> poolNames = {name};
+        std::vector<std::pair<
+            std::shared_ptr<CommonAccessPointAttributes>,
+            std::vector<std::string>>>
+            poolConfigGroups = {std::make_pair(apAttr, poolNames)};
+        partialConfigs_.emplace(
+            poolConfigPath,
+            std::make_pair(enablePartialReconfig, poolConfigGroups));
+      } else {
+        it->second.first = it->second.first && enablePartialReconfig;
+        bool found = false;
+        auto& poolConfigGroups = it->second.second;
+        for (auto& p : poolConfigGroups) {
+          if (*p.first == *apAttr) {
+            p.second.push_back(name);
+            p.first->json[name] = poolConfigJson;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          std::vector<std::string> poolNames = {name};
+          apAttr->json = folly::dynamic::object;
+          apAttr->json[name] = poolConfigJson;
+          poolConfigGroups.emplace_back(apAttr, poolNames);
+        }
+      }
+    }
     return pools_.emplace(std::move(name), std::move(destinations))
         .first->second;
   } catch (const std::exception& e) {
@@ -440,7 +403,9 @@ McRouteHandleProvider<RouterInfo>::makePool(
 
 template <class RouterInfo>
 template <class Transport>
-typename McRouteHandleProvider<RouterInfo>::RouteHandlePtr
+std::pair<
+    typename McRouteHandleProvider<RouterInfo>::RouteHandlePtr,
+    std::shared_ptr<const AccessPoint>>
 McRouteHandleProvider<RouterInfo>::createDestinationRoute(
     std::shared_ptr<AccessPoint> ap,
     std::chrono::milliseconds timeout,
@@ -456,15 +421,18 @@ McRouteHandleProvider<RouterInfo>::createDestinationRoute(
   auto pdstn = proxy_.destinationMap()->template emplace<Transport>(
       std::move(ap), timeout, qosClass, qosPath, poolTkoTracker);
   pdstn->updateShortestTimeout(connectTimeout, timeout);
+  auto resAp = pdstn->accessPoint();
 
-  return makeDestinationRoute<RouterInfo, Transport>(
-      std::move(pdstn),
-      poolName,
-      indexInPool,
-      poolStatIndex,
-      timeout,
-      disableRequestDeadlineCheck,
-      keepRoutingPrefix);
+  return {
+      makeDestinationRoute<RouterInfo, Transport>(
+          std::move(pdstn),
+          poolName,
+          indexInPool,
+          poolStatIndex,
+          timeout,
+          disableRequestDeadlineCheck,
+          keepRoutingPrefix),
+      std::move(resAp)};
 }
 
 template <class RouterInfo>
@@ -552,7 +520,9 @@ McRouteHandleProvider<RouterInfo>::makePoolRoute(
       if (auto jasynclog = json.get_ptr("asynclog")) {
         needAsynclog = parseBool(*jasynclog, "asynclog");
       }
-      if (auto jname = json.get_ptr("name")) {
+      if (auto jasynclogName = json.get_ptr("asynclog_name")) {
+        asynclogName = parseString(*jasynclogName, "asynclog_name");
+      } else if (auto jname = json.get_ptr("name")) {
         asynclogName = parseString(*jname, "name");
       }
     }

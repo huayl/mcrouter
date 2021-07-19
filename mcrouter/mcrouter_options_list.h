@@ -845,6 +845,24 @@ MCROUTER_OPTION_TOGGLE(
     no_short,
     "Enable service router for pool level routing.")
 
+MCROUTER_OPTION_TOGGLE(
+    enable_partial_reconfigure,
+    false,
+    "enable-partial-reconfigure",
+    no_short,
+    "Incrementally update routing tree with simple config source changes. For "
+    " complicated config source change, Mcrouter will resort to build a new "
+    "routing tree as if this flag is disabled.")
+
+MCROUTER_OPTION_INTEGER(
+    size_t,
+    thrift_compression_threshold,
+    0,
+    "thrift-compression-threshold",
+    no_short,
+    "Payloads >= thriftCompressionTreshold will be compressed "
+    "iff thriftCompression is enabled.")
+
 #ifdef ADDITIONAL_OPTIONS_FILE
 #include ADDITIONAL_OPTIONS_FILE
 #endif

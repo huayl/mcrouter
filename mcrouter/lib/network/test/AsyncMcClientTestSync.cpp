@@ -99,7 +99,7 @@ TEST_P(AsyncMcClientSimpleTest, serverShutdownTest) {
     EXPECT_NE(sslsock, nullptr);
   } else if (ssl->mech == SecurityMech::TLS_TO_PLAINTEXT) {
     // TLS_TO_PLAINTEXT
-    EXPECT_EQ(transport->getSecurityProtocol(), "mc_plaintext");
+    EXPECT_EQ(transport->getSecurityProtocol(), "stopTLS");
     auto* sock = transport->getUnderlyingTransport<TlsToPlainTransport>();
     EXPECT_NE(sock, nullptr);
     auto peerCert = transport->getPeerCertificate();
@@ -329,49 +329,6 @@ TEST(AsyncMcClient, noCerts) {
   // we expect the no cert case to fail by default since the test server will
   // require peer certs by default
   testCerts("test-nocerts", noCertClientSsl(), 1);
-}
-
-TEST(AsyncMcClient, testClientFinalize) {
-  folly::AsyncTransportWrapper* clientTransportCalledInFinalizer;
-  McSSLUtil::setApplicationClientTransportFinalizer(
-      [&clientTransportCalledInFinalizer](
-          folly::AsyncTransportWrapper* transport) {
-        clientTransportCalledInFinalizer = transport;
-      });
-
-  folly::AsyncTransportWrapper* serverTransportCalledInFinalizer;
-  McSSLUtil::setApplicationServerTransportFinalizer(
-      [&serverTransportCalledInFinalizer](
-          folly::AsyncTransportWrapper* transport) {
-        serverTransportCalledInFinalizer = transport;
-      });
-
-  TestServer::Config config;
-  config.outOfOrder = false;
-  config.onConnectionAcceptedAdditionalCb = [&](McServerSession& session) {
-    EXPECT_EQ(serverTransportCalledInFinalizer, session.getTransport());
-  };
-  auto server = TestServer::create(std::move(config));
-  std::vector<SecurityMech> mechs{
-      SecurityMech::TLS, SecurityMech::TLS_TO_PLAINTEXT, SecurityMech::KTLS12};
-  for (auto mech : mechs) {
-    auto ssl = validClientSsl();
-    ssl.mech = mech;
-    TestClient client(
-        "localhost", server->getListenPort(), 200, mc_caret_protocol, ssl);
-
-    client.sendGet("test1", carbon::Result::FOUND);
-    client.waitForReplies();
-    EXPECT_EQ(
-        client.getClient().getTransport(), clientTransportCalledInFinalizer);
-  }
-  server->shutdown();
-  server->join();
-  EXPECT_EQ(mechs.size(), server->getAcceptedConns());
-
-  // Unset so we don't pollute other tests
-  McSSLUtil::setApplicationClientTransportFinalizer(
-      [](folly::AsyncTransportWrapper*) {});
 }
 
 class AsyncMcClientBasicTestBase {

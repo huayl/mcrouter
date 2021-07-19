@@ -90,7 +90,7 @@ class RouteHandlesCommandDispatcher {
             const HostInfoPtr& host, const RequestClass& /* unused */) {
           bool haveHost = (host != nullptr);
           tree.append(
-              std::string(level + 1, ' ') + "host: " +
+              std::string(level, ' ') + "host: " +
               (haveHost ? host->location().getIp() : "unknown") + " port:" +
               (haveHost ? folly::to<std::string>(host->location().getPort())
                         : "unknown") +
@@ -364,6 +364,63 @@ ServiceInfo<RouterInfo>::ServiceInfoImpl::ServiceInfoImpl(
         throw std::runtime_error(
             "expected at most 1 argument, got " +
             folly::to<std::string>(args.size()));
+      });
+
+  commands_.emplace(
+      "partial_config_enabled_pools",
+      [&config](const std::vector<folly::StringPiece>& /* args */) {
+        auto partialConfigs = config.getPartialConfigs();
+        folly::dynamic result = folly::dynamic::object;
+        for (const auto& partialConfig : partialConfigs) {
+          folly::dynamic poolsJson = folly::dynamic::object;
+          for (const auto& p : partialConfig.second.second) {
+            poolsJson.update(
+                facebook::memcache::mcrouter::
+                    getConfigJsonFromCommonAccessPointAttributes(p.first));
+          }
+          result[partialConfig.first] = poolsJson;
+        }
+        return toPrettySortedJson(result);
+      });
+  commands_.emplace(
+      "test_replace_ap", [this](const std::vector<folly::StringPiece>& args) {
+        auto& configApi = proxy_.router().configApi();
+        if (args.size() != 3) {
+          return "Error";
+        }
+        auto arg1 = args[1].str();
+        auto arg2 = args[2].str();
+        auto idx1 = arg1.find(":");
+        auto idx2 = arg2.find(":");
+        if (idx1 == std::string::npos || idx2 == std::string::npos) {
+          return "Error";
+        }
+        // As a safety check, allow this only for loopback addresses
+        auto host1 = arg1.substr(0, idx1);
+        auto host2 = arg2.substr(0, idx2);
+        if (!folly::IPAddress(host1).isLoopback() ||
+            !folly::IPAddress(host2).isLoopback()) {
+          return "Error";
+        }
+        facebook::memcache::mcrouter::ConfigApi::PartialUpdate update = {
+            args[0].str(), arg1, arg2, 1, 1, 11111, "", 1};
+        configApi.addPartialUpdateForTest(update);
+        return "Success";
+      });
+
+  commands_.emplace(
+      "pools", [&config](const std::vector<folly::StringPiece>& /* args */) {
+        folly::dynamic result = folly::dynamic::object;
+        auto pools = config.getPools();
+        for (const auto& pool : pools) {
+          folly::dynamic servers = folly::dynamic::array;
+          const auto& poolServers = pool.second;
+          for (auto pdstn : poolServers) {
+            servers.push_back(pdstn->routeName());
+          }
+          result[pool.first] = servers;
+        }
+        return toPrettySortedJson(result);
       });
 }
 

@@ -33,6 +33,7 @@
 #include "mcrouter/ServiceInfo.h"
 #include "mcrouter/TargetHooks.h"
 #include "mcrouter/ThreadUtil.h"
+#include "mcrouter/routes/McRouteHandleProvider.h"
 #include "mcrouter/stats.h"
 
 namespace facebook {
@@ -219,7 +220,6 @@ CarbonRouterInstance<RouterInfo>::spinUp() {
   bool configuringFromDisk = false;
   {
     std::lock_guard<std::mutex> lg(configReconfigLock_);
-
     auto builder = createConfigBuilder();
     if (builder.hasError()) {
       std::string initialError = std::move(builder.error());
@@ -236,15 +236,16 @@ CarbonRouterInstance<RouterInfo>::spinUp() {
       }
     }
 
+    std::string threadPrefix;
     // Create an IOThreadPooLExecutor if there are no evbs configured
     if (!proxyThreads_) {
       // Create IOThreadPoolExecutor
       try {
+        threadPrefix = folly::to<std::string>("mcrpxy-", opts_.router_name);
         proxyThreads_ = std::make_shared<folly::IOThreadPoolExecutor>(
             opts_.num_proxies /* max */,
             opts_.num_proxies /* min */,
-            std::make_shared<folly::NamedThreadFactory>(
-                folly::to<std::string>("mcrpxy-", opts_.router_name)));
+            std::make_shared<folly::NamedThreadFactory>(threadPrefix));
         embeddedMode_ = true;
 
       } catch (...) {
@@ -269,7 +270,7 @@ CarbonRouterInstance<RouterInfo>::spinUp() {
 
     if (opts_.enable_service_router && mcrouter::gSRInitHook) {
       try {
-        setMetadata(mcrouter::gSRInitHook(proxyThreads_, opts_));
+        setMetadata(mcrouter::gSRInitHook(proxyThreads_, threadPrefix, opts_));
       } catch (...) {
         return folly::makeUnexpected(folly::sformat(
             "Failed to create SR {}",
@@ -372,6 +373,21 @@ void CarbonRouterInstance<RouterInfo>::subscribeToConfigUpdate() {
     bool success = false;
     {
       std::lock_guard<std::mutex> lg(configReconfigLock_);
+
+      if (opts_.enable_partial_reconfigure) {
+        try {
+          if (reconfigurePartially()) {
+            configuredFromDisk_.store(false, std::memory_order_relaxed);
+            return;
+          }
+        } catch (const std::exception& e) {
+          MC_LOG_FAILURE(
+              opts(),
+              failure::Category::kInvalidConfig,
+              "Error on partial reconfiguring: {}",
+              e.what());
+        }
+      }
 
       auto builder = createConfigBuilder();
       if (builder) {
@@ -479,6 +495,93 @@ bool CarbonRouterInstance<RouterInfo>::reconfigure(
 }
 
 template <class RouterInfo>
+bool CarbonRouterInstance<RouterInfo>::reconfigurePartially() {
+  auto partialUpdates = configApi_->releasePartialUpdatesLocked();
+  VLOG(2) << "receive partial updates:" << partialUpdates.size();
+  if (partialUpdates.empty()) {
+    return false;
+  }
+  partialReconfigAttempt_.store(
+      partialReconfigAttempt_.load(std::memory_order_relaxed) +
+          partialUpdates.size(),
+      std::memory_order_relaxed);
+
+  // Use the first proxy's config, as it's same in all proxies.
+  // Also there is no contention for holding the read lock as write lock is
+  // only obtained by proxy_config_swap() from config thread (same thread
+  // invoking this function)
+  {
+    auto proxyConfig = getProxy(0)->getConfigLocked();
+    // Make sure partial config is allow for all updates
+    for (const auto& update : partialUpdates) {
+      if (!proxyConfig.second.allowPartialConfig(update.tierName)) {
+        VLOG(1) << folly::sformat(
+            "tier {} not allow partial reconfigure", update.tierName);
+        return false;
+      }
+    }
+  }
+
+  auto& partialConfigs = getProxy(0)->getConfigUnsafe()->getPartialConfigs();
+  for (size_t i = 0; i < opts_.num_proxies; i++) {
+    for (const auto& update : partialUpdates) {
+      auto& tierPartialConfigs = partialConfigs.at(update.tierName).second;
+      if (i == 0) {
+        VLOG(1) << folly::sformat(
+            "partial update: tier={}, oldApString={}, newApString={}, oldFailureDomain={}, newFailureDomain={}",
+            update.tierName,
+            update.oldApString,
+            update.newApString,
+            update.oldFailureDomain,
+            update.newFailureDomain);
+      }
+      for (const auto& [apAttr, poolList] : tierPartialConfigs) {
+        auto oldAp = createAccessPoint(
+            update.oldApString, update.oldFailureDomain, *this, *apAttr);
+        auto newAp =
+            std::const_pointer_cast<const AccessPoint>(createAccessPoint(
+                update.newApString, update.newFailureDomain, *this, *apAttr));
+        if (UNLIKELY(oldAp->getProtocol() != newAp->getProtocol())) {
+          return false;
+        }
+        auto replacedAp = getProxy(i)->replaceAP(*oldAp, newAp);
+        if (!replacedAp) {
+          VLOG(2) << folly::sformat(
+              "could not replace AP for tier={}, proxy={}, protocol={}",
+              update.tierName,
+              i,
+              mc_protocol_to_string(oldAp->getProtocol()));
+          return false;
+        }
+        auto proxyConfig = getProxy(i)->getConfigLocked();
+        for (const auto& pool : poolList) {
+          if (!proxyConfig.second.updateAccessPoints(pool, replacedAp, newAp)) {
+            VLOG(2) << folly::sformat(
+                "could not update AccessPoints for tier={}, pool={}, proxy={}, protocol={}",
+                update.tierName,
+                pool,
+                i,
+                mc_protocol_to_string(oldAp->getProtocol()));
+            return false;
+          }
+        }
+      }
+    }
+  }
+  int numUpdates = partialUpdates.size();
+  if (!configApi_->updatePartialConfigSource(std::move(partialUpdates))) {
+    return false;
+  }
+
+  VLOG_IF(0, !opts_.constantly_reload_configs)
+      << "Partially reconfigured " << opts_.num_proxies << " proxies";
+  partialReconfigSuccess_.store(
+      partialReconfigSuccess_.load(std::memory_order_relaxed) + numUpdates,
+      std::memory_order_relaxed);
+  return true;
+}
+
+template <class RouterInfo>
 folly::Expected<folly::Unit, std::string>
 CarbonRouterInstance<RouterInfo>::configure(const ProxyConfigBuilder& builder) {
   VLOG_IF(0, !opts_.constantly_reload_configs) << "started reconfiguring";
@@ -486,7 +589,7 @@ CarbonRouterInstance<RouterInfo>::configure(const ProxyConfigBuilder& builder) {
   newConfigs.reserve(opts_.num_proxies);
   try {
     for (size_t i = 0; i < opts_.num_proxies; i++) {
-      newConfigs.push_back(builder.buildConfig<RouterInfo>(*getProxy(i)));
+      newConfigs.push_back(builder.buildConfig<RouterInfo>(*getProxy(i), i));
     }
   } catch (const std::exception& e) {
     std::string error = folly::sformat("Failed to reconfigure: {}", e.what());
@@ -515,6 +618,9 @@ CarbonRouterInstance<RouterInfo>::createConfigBuilder() {
   /* mark config attempt before, so that
      successful config is always >= last config attempt. */
   lastConfigAttempt_.store(time(nullptr), std::memory_order_relaxed);
+  configFullAttempt_.store(
+      configFullAttempt_.load(std::memory_order_relaxed) + 1,
+      std::memory_order_relaxed);
   configApi_->trackConfigSources();
   std::string config;
   std::string path;

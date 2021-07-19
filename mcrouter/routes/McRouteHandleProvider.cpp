@@ -51,45 +51,175 @@ namespace facebook {
 namespace memcache {
 namespace mcrouter {
 
+const folly::dynamic& getConfigJsonFromCommonAccessPointAttributes(
+    const std::shared_ptr<CommonAccessPointAttributes>& apAttr) {
+  return apAttr->json;
+}
+
+std::shared_ptr<CommonAccessPointAttributes> getCommonAccessPointAttributes(
+    const folly::dynamic& json,
+    CarbonRouterInstanceBase& router) {
+  auto ret = std::make_shared<CommonAccessPointAttributes>();
+  CommonAccessPointAttributes& apAttr = *ret;
+  if (auto jName = json.get_ptr("name")) {
+    apAttr.poolName = jName->stringPiece();
+  }
+  auto& protocol = apAttr.protocol;
+  protocol = mc_ascii_protocol;
+  if (auto jProtocol = json.get_ptr("protocol")) {
+    auto str = parseString(*jProtocol, "protocol");
+    if (equalStr("ascii", str, folly::AsciiCaseInsensitive())) {
+      protocol = mc_ascii_protocol;
+    } else if (equalStr("caret", str, folly::AsciiCaseInsensitive())) {
+      protocol = mc_caret_protocol;
+    } else if (equalStr("thrift", str, folly::AsciiCaseInsensitive())) {
+      protocol = mc_thrift_protocol;
+    } else {
+      throwLogic("Unknown protocol '{}'", str);
+    }
+  }
+
+  auto& enableCompression = apAttr.enableCompression;
+  enableCompression = router.opts().enable_compression;
+  if (auto jCompression = json.get_ptr("enable_compression")) {
+    enableCompression = parseBool(*jCompression, "enable_compression");
+  }
+
+  auto& mech = apAttr.mech;
+  mech = SecurityMech::NONE;
+  auto& mechOverride = apAttr.mechOverride;
+  auto& withinDcMech = apAttr.withinDcMech;
+  auto& crossDcMech = apAttr.crossDcMech;
+  auto& crossDcPort = apAttr.crossDcPort;
+  auto& withinDcPort = apAttr.withinDcPort;
+  auto& port = apAttr.port;
+  // default to 0, which doesn't override
+  port = 0;
+  if (router.configApi().enableSecurityConfig()) {
+    if (auto jSecurityMech = json.get_ptr("security_mech_within_dc")) {
+      auto mechStr = parseString(*jSecurityMech, "security_mech_within_dc");
+      withinDcMech = parseSecurityMech(mechStr);
+    }
+
+    if (auto jSecurityMech = json.get_ptr("security_mech_cross_dc")) {
+      auto mechStr = parseString(*jSecurityMech, "security_mech_cross_dc");
+      crossDcMech = parseSecurityMech(mechStr);
+    }
+
+    if (withinDcMech.has_value() && crossDcMech.has_value() &&
+        withinDcMech.value() == crossDcMech.value()) {
+      // mech is used if nothing is specified in server ap
+      mech = withinDcMech.value();
+      // mechOverride overrides per-server values
+      mechOverride = withinDcMech.value();
+      withinDcMech.reset();
+      crossDcMech.reset();
+    } else {
+      if (auto jSecurityMech = json.get_ptr("security_mech")) {
+        auto mechStr = parseString(*jSecurityMech, "security_mech");
+        mech = parseSecurityMech(mechStr);
+      } else if (auto jUseSsl = json.get_ptr("use_ssl")) {
+        // deprecated - prefer security_mech
+        auto useSsl = parseBool(*jUseSsl, "use_ssl");
+        if (useSsl) {
+          mech = SecurityMech::TLS;
+        }
+      }
+    }
+
+    if (auto jPort = json.get_ptr("port_override_within_dc")) {
+      withinDcPort = parseInt(*jPort, "port_override_within_dc", 1, 65535);
+    }
+
+    if (auto jPort = json.get_ptr("port_override_cross_dc")) {
+      crossDcPort = parseInt(*jPort, "port_override_cross_dc", 1, 65535);
+    }
+
+    if (withinDcPort.has_value() && crossDcPort.has_value() &&
+        withinDcPort.value() == crossDcPort.value()) {
+      port = withinDcPort.value();
+      withinDcPort.reset();
+      crossDcPort.reset();
+    } else {
+      // parse port override only if withinDc & crossDc are not present
+      if (auto jPort = json.get_ptr("port_override")) {
+        port = parseInt(*jPort, "port_override", 1, 65535);
+      }
+    }
+  }
+  return ret;
+}
+
+std::shared_ptr<AccessPoint> createAccessPoint(
+    folly::StringPiece apString,
+    uint32_t failureDomain,
+    CarbonRouterInstanceBase& router,
+    const CommonAccessPointAttributes& apAttr) {
+  auto& protocol = apAttr.protocol;
+  auto& mech = apAttr.mech;
+  auto& mechOverride = apAttr.mechOverride;
+  auto& withinDcMech = apAttr.withinDcMech;
+  auto& crossDcMech = apAttr.crossDcMech;
+  auto& crossDcPort = apAttr.crossDcPort;
+  auto& withinDcPort = apAttr.withinDcPort;
+  auto& port = apAttr.port;
+  auto& enableCompression = apAttr.enableCompression;
+
+  auto ap = AccessPoint::create(
+      apString, protocol, mech, port, enableCompression, failureDomain);
+  checkLogic(ap != nullptr, "invalid server {}", apString);
+
+  if (mechOverride.has_value()) {
+    ap->setSecurityMech(mechOverride.value());
+  }
+
+  if (withinDcMech.has_value() || crossDcMech.has_value() ||
+      withinDcPort.has_value() || crossDcPort.has_value()) {
+    bool isInLocalDc = isInLocalDatacenter(ap->getHost());
+    if (isInLocalDc) {
+      if (withinDcMech.has_value()) {
+        ap->setSecurityMech(withinDcMech.value());
+      }
+      if (withinDcPort.has_value()) {
+        ap->setPort(withinDcPort.value());
+      }
+    } else {
+      if (crossDcMech.has_value()) {
+        ap->setSecurityMech(crossDcMech.value());
+      }
+      if (crossDcPort.has_value()) {
+        ap->setPort(crossDcPort.value());
+      }
+    }
+  }
+
+  if (ap->compressed() && router.getCodecManager() == nullptr) {
+    if (!initCompression(router)) {
+      MC_LOG_FAILURE(
+          router.opts(),
+          failure::Category::kBadEnvironment,
+          "Pool {}: Failed to initialize compression. "
+          "Disabling compression for host: {}",
+          apAttr.poolName,
+          apString);
+      ap->disableCompression();
+    }
+  }
+
+  return ap;
+}
+
 using McRouteHandleFactory = RouteHandleFactory<McrouterRouteHandleIf>;
 using MemcacheRouterInfo = facebook::memcache::MemcacheRouterInfo;
 
-/**
- * This implementation is only for test purposes. Typically the users of
- * CarbonLookaside will be services other than memcache.
- */
-class MemcacheCarbonLookasideHelper {
- public:
-  MemcacheCarbonLookasideHelper(const folly::dynamic* /* jsonConfig */) {}
+class MemcacheCarbonLookasideHelper;
 
-  static std::string name() {
-    return "MemcacheCarbonLookasideHelper";
-  }
-
-  template <typename Request>
-  bool cacheCandidate(const Request& /* unused */) const {
-    if (HasKeyTrait<Request>::value) {
-      return true;
-    }
-    return false;
-  }
-
-  template <typename Request>
-  std::string buildKey(const Request& req) const {
-    if (HasKeyTrait<Request>::value) {
-      return req.key_ref()->fullKey().str();
-    }
-    return std::string();
-  }
-
-  template <typename Reply>
-  bool shouldCacheReply(const Reply& /* unused */) const {
-    return true;
-  }
-
-  template <typename Reply>
-  void postProcessCachedReply(Reply& /* reply */) const {}
-};
+// This is rather expensive to instantiate, therefore explicitly instantiated
+// in separate file: `McrouteHandleProvider-CarbonLookasideRoute.cpp`.
+extern template MemcacheRouterInfo::RouteHandlePtr
+createCarbonLookasideRoute<MemcacheRouterInfo, MemcacheCarbonLookasideHelper>(
+    RouteHandleFactory<MemcacheRouteHandleIf>& factory,
+    const folly::dynamic& json);
 
 McrouterRouteHandlePtr makeWarmUpRoute(
     McRouteHandleFactory& factory,
@@ -114,13 +244,16 @@ McRouteHandleProvider<MemcacheRouterInfo>::createSRRoute(
       if (auto* jNeedAsynclog = json.get_ptr("asynclog")) {
         needAsynclog = parseBool(*jNeedAsynclog, "asynclog");
       }
-
       if (needAsynclog) {
-        auto jAsynclogName = json.get_ptr("service_name");
-        checkLogic(
-            jAsynclogName != nullptr,
-            "AsynclogRoute over SRRoute: 'service_name' property is missing");
-        auto asynclogName = parseString(*jAsynclogName, "service_name");
+        folly::StringPiece asynclogName;
+        if (auto jAsynclogName = json.get_ptr("asynclog_name")) {
+          asynclogName = parseString(*jAsynclogName, "asynclog_name");
+        } else if (auto jServiceName = json.get_ptr("service_name")) {
+          asynclogName = parseString(*jServiceName, "service_name");
+        } else {
+          throwLogic(
+              "AsynclogRoute over SRRoute: 'service_name' property is missing");
+        }
         return createAsynclogRoute(std::move(route), asynclogName.toString());
       }
       return route;
